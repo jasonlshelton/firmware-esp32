@@ -1,5 +1,6 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_task_wdt.h>
 #include <esp_websocket_client.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -20,6 +21,11 @@ static const char *TAG = "gfx";
 #define GFX_TASK_CORE 1
 #define GFX_TASK_PRIO 2
 #define GFX_TASK_STACK_SIZE 4092
+
+// Never send with portMAX_DELAY: the websocket client turns that into an
+// untimed socket write, and a send that stalls would block this task (and the
+// websocket task behind it) forever.
+#define WS_SEND_TIMEOUT_TICKS pdMS_TO_TICKS(5000)
 
 struct gfx_state {
   TaskHandle_t task;
@@ -229,7 +235,7 @@ static void send_websocket_notification(int counter) {
   }
 
   int sent = esp_websocket_client_send_text(_state->ws_handle, message, len,
-                                            portMAX_DELAY);
+                                            WS_SEND_TIMEOUT_TICKS);
   if (sent < 0) {
     ESP_LOGE(TAG, "Failed to send websocket notification");
   } else {
@@ -276,9 +282,12 @@ int gfx_update(void *webp, size_t len, int32_t dwell_secs) {
     int msg_len =
         snprintf(message, sizeof(message), "{\"queued\":%d}", counter);
     if (msg_len > 0 && msg_len < sizeof(message)) {
-      esp_websocket_client_send_text(_state->ws_handle, message, msg_len,
-                                     portMAX_DELAY);
-      ESP_LOGI(TAG, "WS Send: %s", message);
+      if (esp_websocket_client_send_text(_state->ws_handle, message, msg_len,
+                                         WS_SEND_TIMEOUT_TICKS) < 0) {
+        ESP_LOGE(TAG, "Failed to send websocket queued notification");
+      } else {
+        ESP_LOGI(TAG, "WS Send: %s", message);
+      }
     }
   }
 
@@ -369,7 +378,13 @@ static void gfx_loop(void *args) {
   int counter = -1;
   ESP_LOGI(TAG, "Graphics loop running on core %d", xPortGetCoreID());
 
+  // Reset the device if this task ever stops making progress
+  esp_task_wdt_add(NULL);
+
   for (;;) {
+    esp_task_wdt_reset();
+    bool notify = false;
+
     if (_state->paused) {
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
@@ -395,14 +410,18 @@ static void gfx_loop(void *args) {
       counter = _state->counter;
       _state->loaded_counter = counter;  // Signal that we've loaded this image
       if (isAnimating == -1 && !_state->paused) isAnimating = 1;
-
-      // Send websocket notification that we're now displaying this image
-      send_websocket_notification(counter);
+      notify = true;
     }
 
     if (pdTRUE != xSemaphoreGive(_state->mutex)) {
       ESP_LOGE(TAG, "Could not give gfx mutex");
       continue;
+    }
+
+    // Send websocket notification that we're now displaying this image. Done
+    // after releasing the mutex so a slow send can't block gfx_update().
+    if (notify) {
+      send_websocket_notification(counter);
     }
 
     static UBaseType_t last_stack_free = 0;
@@ -444,7 +463,7 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
                              // show the image for 1 more second.
   } else {
     // ESP_LOGI(TAG, "dwell_secs : %d", app_dwell_secs);
-    dwell_us = app_dwell_secs * 1000000;
+    dwell_us = (int64_t)app_dwell_secs * 1000000;
   }
   // ESP_LOGI(TAG, "frame count: %d", animation.frame_count);
 
@@ -483,7 +502,14 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
     while (WebPAnimDecoderHasMoreFrames(decoder) && *isAnimating != -1 && !_state->paused) {
       uint8_t *pix;
       int timestamp;
-      WebPAnimDecoderGetNext(decoder, &pix, &timestamp);
+      // On failure the decoder does not advance, so HasMoreFrames() stays true
+      // and pix/timestamp are not written: bail out instead of looping forever
+      if (!WebPAnimDecoderGetNext(decoder, &pix, &timestamp)) {
+        ESP_LOGE(TAG, "Could not decode WebP frame");
+        WebPAnimDecoderDelete(decoder);
+        return 1;
+      }
+      esp_task_wdt_reset();
       if (delay > 0) {
         xTaskDelayUntil(&drawStartTick, pdMS_TO_TICKS(delay));
       } else {
@@ -517,6 +543,7 @@ static int draw_webp(const uint8_t *buf, size_t len, int32_t dwell_secs,
           // Immediate command received, break out of dwell time
           break;
         }
+        esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(100));  // Check every 100ms
       }
       break;
