@@ -3,6 +3,7 @@
 #include <esp_crt_bundle.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_task_wdt.h>
 #include <esp_timer.h>
 #include <esp_websocket_client.h>
 #include <freertos/FreeRTOS.h>
@@ -35,6 +36,15 @@
 // Default URL if none is provided through WiFi manager
 #define DEFAULT_URL "http://URL.NOT.SET/"
 #define WEBSOCKET_PROTOCOL_VERSION 1
+// Never send with portMAX_DELAY: the websocket client turns that into an
+// untimed socket write that can block the calling task forever.
+#define WS_SEND_TIMEOUT_TICKS pdMS_TO_TICKS(5000)
+// Reboot when the websocket has been down this long; nothing else recovers a
+// device whose WiFi or TLS stack can no longer reconnect.
+#define WS_DISCONNECT_REBOOT_US (15 * 60 * 1000000LL)
+// Longest the HTTP loop waits for the current image to finish. Dwell is
+// capped at 300s in remote_get(), so anything longer means gfx is stuck.
+#define ANIMATION_WAIT_TIMEOUT_US (330 * 1000000LL)
 
 #ifndef CONFIG_REFRESH_INTERVAL_SECONDS
 #define CONFIG_REFRESH_INTERVAL_SECONDS 10
@@ -134,7 +144,7 @@ static esp_err_t send_client_info(void) {
       if (json_str) {
         ESP_LOGI(TAG, "Sending client info: %s", json_str);
         int sent = esp_websocket_client_send_text(
-            ws_handle, json_str, strlen(json_str), portMAX_DELAY);
+            ws_handle, json_str, strlen(json_str), WS_SEND_TIMEOUT_TICKS);
         if (sent < 0) {
           ESP_LOGE(TAG, "Failed to send client info: %d", sent);
           ret = ESP_FAIL;
@@ -731,6 +741,9 @@ void app_main(void) {
   ESP_LOGI(TAG, "Free internal RAM: %" PRIu32,
            heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
+  // Reset the device if the main loop below ever stops making progress
+  esp_task_wdt_add(NULL);
+
   // Check for ws:// or wss:// in the URL
   if (strncmp(image_url, "ws://", 5) == 0 ||
       strncmp(image_url, "wss://", 6) == 0) {
@@ -808,8 +821,15 @@ void app_main(void) {
         60 * 1000000LL;  // Log every 60 seconds
 
     for (;;) {
+      esp_task_wdt_reset();
       bool is_connected = esp_websocket_client_is_connected(ws_handle);
       int64_t now = esp_timer_get_time();
+
+      if (!is_connected &&
+          (now - last_connected_time) > WS_DISCONNECT_REBOOT_US) {
+        ESP_LOGE(TAG, "WebSocket not connected for too long, rebooting");
+        esp_restart();
+      }
 
       if (is_connected) {
         if (!was_connected) {
@@ -867,6 +887,7 @@ void app_main(void) {
           if (touch_event != TOUCH_EVENT_NONE) {
             handle_touch_event(touch_event);
           }
+          esp_task_wdt_reset();
           vTaskDelay(pdMS_TO_TICKS(50));  // 50ms = responsive touch
         }
       }
@@ -879,6 +900,7 @@ void app_main(void) {
     ESP_LOGW(TAG, "HTTP Loop Start with URL: %s", image_url);
     uint8_t brightness_pct = nvs_get_brightness();
     for (;;) {
+      esp_task_wdt_reset();
       uint8_t* webp;
       size_t len;
       int status_code = 0;
@@ -897,6 +919,7 @@ void app_main(void) {
           (esp_timer_get_time() - fetch_start_us) / 1000;
 
       ESP_LOGI(TAG, "HTTP fetch returned in %lld ms", fetch_duration_ms);
+      esp_task_wdt_reset();
 
       if (ota_url != NULL) {
         ESP_LOGI(TAG, "OTA URL received via HTTP: %s", ota_url);
@@ -949,7 +972,16 @@ void app_main(void) {
         // Wait for the current animation to finish (isAnimating will be 0)
         if (isAnimating > 0) {
           ESP_LOGI(TAG, "Waiting for current webp to finish");
+          int64_t wait_start_us = esp_timer_get_time();
           while (isAnimating > 0) {
+            if (esp_timer_get_time() - wait_start_us >
+                ANIMATION_WAIT_TIMEOUT_US) {
+              // Keep fetching so a stuck gfx task can't also cut us off from
+              // the server (and its reboot command)
+              ESP_LOGE(TAG, "Timeout waiting for current webp to finish");
+              break;
+            }
+            esp_task_wdt_reset();
             vTaskDelay(pdMS_TO_TICKS(1));
           }
         }
@@ -961,6 +993,7 @@ void app_main(void) {
         // queued_counter);
         int timeout = 0;
         while (gfx_get_loaded_counter() != queued_counter && timeout < 20000) {
+          esp_task_wdt_reset();
           vTaskDelay(pdMS_TO_TICKS(10));
           timeout += 10;
         }
